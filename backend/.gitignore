@@ -1,0 +1,28 @@
+# Python env and build cache
+venv/
+env/
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# JS and tool cache
+node_modules/
+.cache/
+
+# Local datasets / runtime artifacts
+datasets/
+patients/
+tools/ngrok/
+*.m4a
+*.wav
+
+# Local installer and embedded conda env
+Miniforge3-Linux-x86_64.sh
+miniforge3/
+
+# Defensive exclusions for accidental nested copies
+Medgemm_AR_Glasses/
+.git/
