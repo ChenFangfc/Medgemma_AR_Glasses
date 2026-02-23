@@ -1,0 +1,14 @@
+[Unit]
+Description=MedGemma WebSocket Server (GPU 1)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/local/chenf3
+Environment=MEDGEMMA_GPU=1
+ExecStart=/srv/local/chenf3/miniforge3/envs/medgemma/bin/uvicorn server_gemma:app --host 0.0.0.0 --port 8002 --workers 1 --ws-max-size 33554432
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

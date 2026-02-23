@@ -1,0 +1,14 @@
+[Unit]
+Description=MedASR WebSocket Server (GPU 0)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/local/chenf3
+Environment=MEDASR_GPU=0
+ExecStart=/srv/local/chenf3/miniforge3/envs/medasr/bin/uvicorn server_asr:app --host 0.0.0.0 --port 8001 --workers 1 --ws-max-size 33554432
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
