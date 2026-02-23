@@ -29,6 +29,9 @@ TURN_STREAM_MAX_BYTES = int(
     os.environ.get("WORKFLOW_TURN_STREAM_MAX_BYTES", str(10 * 1024 * 1024))
 )
 TURN_STREAM_TIMEOUT_S = float(os.environ.get("WORKFLOW_TURN_STREAM_TIMEOUT_S", "60"))
+WORKFLOW_IMAGE_MAX_BYTES = int(
+    os.environ.get("WORKFLOW_IMAGE_MAX_BYTES", str(8 * 1024 * 1024))
+)
 
 DEFAULT_NOTE_MAX_NEW_TOKENS = int(os.environ.get("WORKFLOW_NOTE_MAX_NEW_TOKENS", "768"))
 DEFAULT_ADVICE_MAX_NEW_TOKENS = int(
@@ -186,6 +189,89 @@ def _clamp_max_tokens(raw_value: Any, default_value: int) -> int:
     except Exception:
         value = default_value
     return max(1, min(value, 1024))
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _decode_image_b64_payload(raw_image_b64: Any) -> tuple[str, bytes, str | None]:
+    raw = str(raw_image_b64 or "").strip()
+    if not raw:
+        raise ValueError("image_b64 is empty")
+    data_uri_mime: str | None = None
+    if raw.startswith("data:") and "," in raw:
+        header, payload = raw.split(",", 1)
+        mime_match = re.match(r"^data:([^;]+);base64$", header.strip(), flags=re.IGNORECASE)
+        if mime_match:
+            data_uri_mime = mime_match.group(1).strip().lower()
+        raw = payload
+    normalized = re.sub(r"\s+", "", raw)
+    if not normalized:
+        raise ValueError("image_b64 is empty")
+    try:
+        image_bytes = base64.b64decode(normalized, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid base64 in image_b64") from exc
+    if not image_bytes:
+        raise ValueError("image_b64 decoded to empty bytes")
+    if len(image_bytes) > WORKFLOW_IMAGE_MAX_BYTES:
+        raise ValueError(
+            f"image exceeds max bytes ({WORKFLOW_IMAGE_MAX_BYTES})"
+        )
+    return normalized, image_bytes, data_uri_mime
+
+
+def _parse_optional_image_payload(
+    msg: dict[str, Any],
+) -> tuple[str | None, str | None, bytes | None, dict[str, Any] | None]:
+    raw_image_b64 = msg.get("image_b64")
+    if raw_image_b64 is None:
+        return None, None, None, None
+    if isinstance(raw_image_b64, str) and not raw_image_b64.strip():
+        return None, None, None, None
+
+    normalized_b64, image_bytes, data_uri_mime = _decode_image_b64_payload(raw_image_b64)
+    image_mime = str(msg.get("image_mime", "")).strip().lower() or data_uri_mime
+    width = _optional_positive_int(msg.get("image_width"))
+    height = _optional_positive_int(msg.get("image_height"))
+    image_meta: dict[str, Any] = {
+        "bytes": len(image_bytes),
+    }
+    if image_mime:
+        image_meta["mime"] = image_mime
+    if width is not None:
+        image_meta["width"] = width
+    if height is not None:
+        image_meta["height"] = height
+    return normalized_b64, image_mime, image_bytes, image_meta
+
+
+def _image_suffix(image_bytes: bytes, image_mime: str | None) -> str:
+    mime = (image_mime or "").strip().lower()
+    if mime == "image/jpeg" or mime == "image/jpg":
+        return ".jpg"
+    if mime == "image/png":
+        return ".png"
+    if mime == "image/webp":
+        return ".webp"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    return ".img"
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -1117,6 +1203,8 @@ async def _generate_turn_outputs(
     asr_text: str,
     max_new_tokens: int,
     request_id_prefix: str,
+    image_b64: str | None = None,
+    image_mime: str | None = None,
 ) -> tuple[str, str, str, int | None, bool, float]:
     repair_source = (
         f"Running summary:\n{running_summary or 'No prior running summary available.'}\n\n"
@@ -1139,6 +1227,8 @@ async def _generate_turn_outputs(
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             request_id=f"{request_id_prefix}:turn:{idx+1}",
+            image_b64=image_b64,
+            image_mime=image_mime,
         )
         last_latency = gemma_response.get("latency_ms")
         if isinstance(last_latency, int):
@@ -1166,6 +1256,8 @@ async def _generate_turn_outputs(
                     ),
                     max_new_tokens=max_new_tokens,
                     request_id=f"{request_id_prefix}:advice-regenerate",
+                    image_b64=image_b64,
+                    image_mime=image_mime,
                 )
                 regen_latency = regen_response.get("latency_ms")
                 if isinstance(regen_latency, int):
@@ -1235,13 +1327,23 @@ async def _call_asr(payload: dict[str, Any]) -> dict[str, Any]:
         return response
 
 
-async def _call_gemma(prompt: str, max_new_tokens: int, request_id: str) -> dict[str, Any]:
+async def _call_gemma(
+    prompt: str,
+    max_new_tokens: int,
+    request_id: str,
+    image_b64: str | None = None,
+    image_mime: str | None = None,
+) -> dict[str, Any]:
     payload = {
         "op": "generate",
         "request_id": request_id,
         "prompt": prompt,
         "max_new_tokens": max_new_tokens,
     }
+    if image_b64:
+        payload["image_b64"] = image_b64
+    if image_mime:
+        payload["image_mime"] = image_mime
     async with websockets.connect(GEMMA_WS_URL, max_size=UPSTREAM_MAX_SIZE) as client:
         ready = await _recv_json(client, "gemma-ready")
         if ready.get("op") != "ready":
@@ -1543,6 +1645,10 @@ async def _run_turn_pipeline(
     note_max_new_tokens: int,
     advice_max_new_tokens: int,
     stream_meta: dict[str, Any] | None = None,
+    image_b64: str | None = None,
+    image_mime: str | None = None,
+    image_bytes: bytes | None = None,
+    image_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     async with SESSIONS_LOCK:
         session = SESSIONS.get(session_id)
@@ -1575,6 +1681,8 @@ async def _run_turn_pipeline(
                 asr_text=asr_text,
                 max_new_tokens=turn_max_new_tokens,
                 request_id_prefix=request_id,
+                image_b64=image_b64,
+                image_mime=image_mime,
             ),
             timeout=WORKFLOW_TIMEOUT_S,
         )
@@ -1624,6 +1732,22 @@ async def _run_turn_pipeline(
         }
         if stream_meta:
             turn_record["stream"] = stream_meta
+        if image_meta:
+            turn_record["image"] = dict(image_meta)
+        if image_bytes is not None:
+            image_name = f"{turn_index:04d}_image{_image_suffix(image_bytes, image_mime)}"
+            image_path = session.turns_dir / image_name
+            try:
+                image_path.write_bytes(image_bytes)
+                turn_record.setdefault("image", {})["file"] = image_name
+            except Exception as exc:
+                LOGGER.warning(
+                    "turn_image_save_failed session_id=%s request_id=%s turn_index=%s error=%s",
+                    session_id,
+                    request_id,
+                    turn_index,
+                    exc,
+                )
 
         session.running_summary = running_summary_after
         session.summary_turns.append(summary_turn)
@@ -2015,6 +2139,14 @@ async def ws_workflow(ws: WebSocket) -> None:
                     await _send_error(ws, request_id, str(exc))
                     continue
 
+                try:
+                    image_b64, image_mime, image_bytes, image_meta = _parse_optional_image_payload(
+                        msg
+                    )
+                except ValueError as exc:
+                    await _send_error(ws, request_id, str(exc))
+                    continue
+
                 key = _stream_key(session_id, turn_id)
                 async with TURN_STREAMS_LOCK:
                     stream = TURN_STREAMS.pop(key, None)
@@ -2087,13 +2219,16 @@ async def ws_workflow(ws: WebSocket) -> None:
                     "duration_ms_estimate": stream_duration_ms,
                 }
                 LOGGER.info(
-                    "audio_end_start client=%s request_id=%s session_id=%s turn_id=%s chunk_count=%s pcm_bytes=%s return_fields=%s",
+                    "audio_end_start client=%s request_id=%s session_id=%s turn_id=%s chunk_count=%s pcm_bytes=%s has_image_b64=%s image_mime=%s image_bytes=%s return_fields=%s",
                     _client_addr(ws),
                     request_id,
                     session_id,
                     turn_id,
                     stream.expected_seq,
                     len(pcm_bytes),
+                    bool(image_b64),
+                    image_mime or "",
+                    len(image_bytes) if image_bytes is not None else 0,
                     return_fields,
                 )
                 try:
@@ -2105,6 +2240,10 @@ async def ws_workflow(ws: WebSocket) -> None:
                         note_max_new_tokens=note_max_new_tokens,
                         advice_max_new_tokens=advice_max_new_tokens,
                         stream_meta=stream_meta,
+                        image_b64=image_b64,
+                        image_mime=image_mime,
+                        image_bytes=image_bytes,
+                        image_meta=image_meta,
                     )
                 except asyncio.TimeoutError:
                     LOGGER.warning(
@@ -2174,13 +2313,24 @@ async def ws_workflow(ws: WebSocket) -> None:
                     await _send_error(ws, request_id, "missing audio_b64 or audio_path")
                     continue
 
+                try:
+                    image_b64, image_mime, image_bytes, image_meta = _parse_optional_image_payload(
+                        msg
+                    )
+                except ValueError as exc:
+                    await _send_error(ws, request_id, str(exc))
+                    continue
+
                 LOGGER.info(
-                    "process_audio_start client=%s request_id=%s session_id=%s has_audio_b64=%s has_audio_path=%s return_fields=%s",
+                    "process_audio_start client=%s request_id=%s session_id=%s has_audio_b64=%s has_audio_path=%s has_image_b64=%s image_mime=%s image_bytes=%s return_fields=%s",
                     _client_addr(ws),
                     request_id,
                     session_id,
                     bool(audio_b64),
                     bool(audio_path),
+                    bool(image_b64),
+                    image_mime or "",
+                    len(image_bytes) if image_bytes is not None else 0,
                     return_fields,
                 )
 
@@ -2225,6 +2375,10 @@ async def ws_workflow(ws: WebSocket) -> None:
                         asr_payload=asr_payload,
                         note_max_new_tokens=note_max_new_tokens,
                         advice_max_new_tokens=advice_max_new_tokens,
+                        image_b64=image_b64,
+                        image_mime=image_mime,
+                        image_bytes=image_bytes,
+                        image_meta=image_meta,
                     )
                 except asyncio.TimeoutError:
                     LOGGER.warning(

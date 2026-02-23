@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import base64
 import json
+import mimetypes
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Workflow smoke test (2 turns)")
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8003/ws")
     parser.add_argument("--audio", default="/srv/local/chenf3/medasr_test001.m4a")
+    parser.add_argument("--image", default="")
+    parser.add_argument("--image-mime", default="")
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -34,6 +37,13 @@ async def _run(args: argparse.Namespace) -> None:
     audio_path = Path(args.audio).expanduser().resolve()
     _require(audio_path.exists(), f"audio file not found: {audio_path}")
     audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
+    image_b64 = ""
+    image_mime = ""
+    if args.image:
+        image_path = Path(args.image).expanduser().resolve()
+        _require(image_path.exists(), f"image file not found: {image_path}")
+        image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+        image_mime = args.image_mime.strip() or (mimetypes.guess_type(str(image_path))[0] or "")
 
     async with websockets.connect(args.ws_url, max_size=256 * 1024 * 1024) as ws:
         ready = await _recv_json(ws, timeout_s=30)
@@ -59,22 +69,25 @@ async def _run(args: argparse.Namespace) -> None:
 
         async def process_turn(turn_num: int) -> dict[str, Any]:
             req_id = f"t{turn_num}"
+            payload: dict[str, Any] = {
+                "op": "process_audio",
+                "request_id": req_id,
+                "session_id": session_id,
+                "audio_b64": audio_b64,
+                "sample_rate": args.sample_rate,
+                "return": [
+                    "note_full",
+                    "advice_full",
+                    "summary_turn",
+                    "running_summary",
+                ],
+            }
+            if image_b64:
+                payload["image_b64"] = image_b64
+            if image_mime:
+                payload["image_mime"] = image_mime
             await ws.send(
-                json.dumps(
-                    {
-                        "op": "process_audio",
-                        "request_id": req_id,
-                        "session_id": session_id,
-                        "audio_b64": audio_b64,
-                        "sample_rate": args.sample_rate,
-                        "return": [
-                            "note_full",
-                            "advice_full",
-                            "summary_turn",
-                            "running_summary",
-                        ],
-                    }
-                )
+                json.dumps(payload)
             )
             resp = await _recv_json(ws, timeout_s=240)
             _require(resp.get("op") == "turn_result", f"process_audio failed turn {turn_num}: {resp}")

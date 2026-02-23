@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import base64
 import json
+import mimetypes
 import subprocess
 import uuid
 from pathlib import Path
@@ -15,6 +16,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Chunked WS smoke test for med workflow")
     parser.add_argument("--ws-url", default="ws://127.0.0.1:8003/ws")
     parser.add_argument("--audio", default="/srv/local/chenf3/medasr_test001.m4a")
+    parser.add_argument("--image", default="")
+    parser.add_argument("--image-mime", default="")
     parser.add_argument("--chunk-ms", type=int, default=500)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--seq-start", type=int, default=1)
@@ -76,6 +79,14 @@ async def _run(args: argparse.Namespace) -> None:
         raise RuntimeError("--seq-start must be >= 0")
 
     pcm_bytes = _ffmpeg_decode_pcm16le(audio_path, args.sample_rate)
+    image_b64 = ""
+    image_mime = ""
+    if args.image:
+        image_path = Path(args.image).expanduser().resolve()
+        if not image_path.exists():
+            raise RuntimeError(f"image file not found: {image_path}")
+        image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+        image_mime = args.image_mime.strip() or (mimetypes.guess_type(str(image_path))[0] or "")
     bytes_per_ms = max(1, int(args.sample_rate * 2 / 1000))
     chunk_bytes = max(320, bytes_per_ms * args.chunk_ms)
     chunks = _chunks(pcm_bytes, chunk_bytes)
@@ -140,17 +151,18 @@ async def _run(args: argparse.Namespace) -> None:
             _require(ack.get("accepted") is True, f"chunk not accepted at seq {idx}: {ack}")
         print(f"PASS audio_chunk sent={len(chunks)} total_pcm_bytes={len(pcm_bytes)}")
 
-        await ws.send(
-            json.dumps(
-                {
-                    "op": "audio_end",
-                    "request_id": "e1",
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "return": ["note_full", "advice_full", "summary_turn", "running_summary"],
-                }
-            )
-        )
+        payload: dict[str, Any] = {
+            "op": "audio_end",
+            "request_id": "e1",
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "return": ["note_full", "advice_full", "summary_turn", "running_summary"],
+        }
+        if image_b64:
+            payload["image_b64"] = image_b64
+        if image_mime:
+            payload["image_mime"] = image_mime
+        await ws.send(json.dumps(payload))
         end = await _recv_json(ws, timeout_s=240)
         _require(end.get("op") == "turn_result", f"audio_end failed: {end}")
         _require(bool(str(end.get("note_full", "")).strip()), "turn_result missing note_full")

@@ -1,25 +1,43 @@
 import asyncio
+import base64
+import binascii
+import io
+import logging
 import os
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Pin MedGemma to GPU1 by default.
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", os.environ.get("MEDGEMMA_GPU", "1"))
 
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from PIL import Image
+from PIL import Image, ImageOps, UnidentifiedImageError
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
 DEFAULT_MAX_NEW_TOKENS = 256
 GEMMA_TIMEOUT_S = float(os.environ.get("GEMMA_TIMEOUT_S", "180"))
 GEMMA_CONCURRENCY = max(1, int(os.environ.get("GEMMA_CONCURRENCY", "1")))
+GEMMA_IMAGE_SIZE = int(os.environ.get("GEMMA_IMAGE_SIZE", "896"))
+GEMMA_IMAGE_MAX_BYTES = int(
+    os.environ.get("GEMMA_IMAGE_MAX_BYTES", str(8 * 1024 * 1024))
+)
+RESAMPLE_BICUBIC = (
+    Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+)
 
 app = FastAPI(title="MedGemma WebSocket Server")
 GEMMA_SEM = asyncio.Semaphore(GEMMA_CONCURRENCY)
+LOGGER = logging.getLogger("medgemma_ws")
+if not LOGGER.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+LOGGER.setLevel(logging.INFO)
 
 GEMMA_MODEL = None
 GEMMA_PROC = None
@@ -60,17 +78,117 @@ def load_gemma_model() -> None:
     DEVICE_NAME = torch.cuda.get_device_name(0) if CUDA_AVAILABLE else "cpu"
 
 
+def _decode_image_b64(image_b64: str) -> tuple[bytes, str | None]:
+    raw = str(image_b64 or "").strip()
+    data_uri_mime: str | None = None
+    if raw.startswith("data:") and "," in raw:
+        header, payload = raw.split(",", 1)
+        mime_match = re.match(r"^data:([^;]+);base64$", header.strip(), flags=re.IGNORECASE)
+        if mime_match:
+            data_uri_mime = mime_match.group(1).strip().lower()
+        raw = payload
+    raw = re.sub(r"\s+", "", raw)
+    if not raw:
+        raise ValueError("image_b64 is empty")
+    try:
+        image_bytes = base64.b64decode(raw, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("invalid base64 in image_b64") from exc
+    if not image_bytes:
+        raise ValueError("image_b64 decoded to empty bytes")
+    if len(image_bytes) > GEMMA_IMAGE_MAX_BYTES:
+        raise ValueError(
+            f"image exceeds max bytes ({GEMMA_IMAGE_MAX_BYTES})"
+        )
+    return image_bytes, data_uri_mime
+
+
+def _normalize_image(image: Image.Image) -> Image.Image:
+    rgb = image.convert("RGB")
+    return ImageOps.pad(
+        rgb,
+        (GEMMA_IMAGE_SIZE, GEMMA_IMAGE_SIZE),
+        method=RESAMPLE_BICUBIC,
+        color=(0, 0, 0),
+        centering=(0.5, 0.5),
+    )
+
+
+def _load_optional_image(
+    *,
+    image_path: Optional[str],
+    image_b64: Optional[str],
+    image_mime: Optional[str],
+) -> tuple[Image.Image | None, dict[str, Any]]:
+    if image_b64:
+        image_bytes, mime_from_data_uri = _decode_image_b64(image_b64)
+        effective_mime = (image_mime or mime_from_data_uri or "").strip().lower()
+        LOGGER.info(
+            "gemma_image_input source=b64 bytes=%s mime=%s",
+            len(image_bytes),
+            effective_mime or "unknown",
+        )
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                normalized = _normalize_image(img)
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError(f"invalid image payload: {exc}") from exc
+        LOGGER.info(
+            "gemma_image_normalized source=b64 size=%sx%s",
+            normalized.width,
+            normalized.height,
+        )
+        return normalized, {
+            "source": "b64",
+            "bytes": len(image_bytes),
+            "mime": effective_mime,
+        }
+
+    if image_path:
+        path = Path(str(image_path)).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Image file not found: {path}")
+        raw_bytes = path.read_bytes()
+        LOGGER.info(
+            "gemma_image_input source=path bytes=%s path=%s",
+            len(raw_bytes),
+            path,
+        )
+        if len(raw_bytes) > GEMMA_IMAGE_MAX_BYTES:
+            raise ValueError(
+                f"image exceeds max bytes ({GEMMA_IMAGE_MAX_BYTES})"
+            )
+        try:
+            with Image.open(path) as img:
+                normalized = _normalize_image(img)
+        except (UnidentifiedImageError, OSError) as exc:
+            raise ValueError(f"invalid image payload: {exc}") from exc
+        LOGGER.info(
+            "gemma_image_normalized source=path size=%sx%s",
+            normalized.width,
+            normalized.height,
+        )
+        return normalized, {
+            "source": "path",
+            "bytes": len(raw_bytes),
+            "path": str(path),
+        }
+
+    return None, {}
+
+
 def gemma_generate(
     prompt: str,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     image_path: Optional[str] = None,
+    image_b64: Optional[str] = None,
+    image_mime: Optional[str] = None,
 ) -> str:
-    image = None
-    if image_path:
-        path = Path(image_path).expanduser()
-        if not path.exists():
-            raise FileNotFoundError(f"Image file not found: {path}")
-        image = Image.open(path).convert("RGB")
+    image, _ = _load_optional_image(
+        image_path=image_path,
+        image_b64=image_b64,
+        image_mime=image_mime,
+    )
 
     content = []
     if image is not None:
@@ -174,12 +292,29 @@ async def ws_gemma(ws: WebSocket):
 
             max_new_tokens = int(msg.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS))
             image_path = msg.get("image_path")
+            image_b64 = msg.get("image_b64")
+            image_mime = str(msg.get("image_mime", "")).strip() or None
+            LOGGER.info(
+                "gemma_generate_start request_id=%s has_image_b64=%s has_image_path=%s image_mime=%s max_new_tokens=%s",
+                req_id,
+                bool(image_b64),
+                bool(image_path),
+                image_mime or "",
+                max_new_tokens,
+            )
 
             t0 = time.time()
             try:
                 async with GEMMA_SEM:
                     text = await asyncio.wait_for(
-                        asyncio.to_thread(gemma_generate, prompt, max_new_tokens, image_path),
+                        asyncio.to_thread(
+                            gemma_generate,
+                            prompt,
+                            max_new_tokens,
+                            image_path,
+                            image_b64,
+                            image_mime,
+                        ),
                         timeout=GEMMA_TIMEOUT_S,
                     )
             except asyncio.TimeoutError:
