@@ -438,3 +438,143 @@ Gemma:
 - `session_id` exists
 - `turn_id` consistent across begin/chunk/end
 - `seq` strictly increments as expected
+
+---
+
+## 11) Frontend (Unity)
+
+This section documents the Unity AR glasses client.
+
+### 11.1 Project scope
+
+Frontend responsibilities:
+- Capture wheel input and voice commands
+- Record microphone audio
+- Send workflow requests over WebSocket
+- Render note/advice views and runtime status
+- Optional photo capture and upload enhancement
+
+Main Unity scripts:
+- `Assets/Scripts/ArGlassesClinicalAssistant.cs`
+- `Assets/Scripts/ArWorkflowWebSocket.cs`
+- `Assets/Scripts/ArAudioRecorder.cs`
+- `Assets/Scripts/ArWheelInputRouter.cs`
+- `Assets/Scripts/ArGlassesUiPresenter.cs`
+- `Assets/Scripts/ArPhotoCapture.cs`
+- `Assets/Scripts/ArDigiOSVoiceUiBridge.cs`
+- `Assets/Scripts/AndroidRuntimePermissions.cs`
+- `Assets/Scripts/ArSimpleJson.cs`
+
+Unity version:
+- `2022.3.21f1`
+
+Main scene:
+- `Assets/Scenes/SampleScene.unity`
+
+### 11.2 Input mapping
+
+Current mapping:
+- Single press (`Return`): toggle view `NOTE <-> ADVICE`
+- Long press (`Menu`): start/stop recording
+- Scroll (`LeftArrow`/`RightArrow`): smooth body scroll
+- Double click on ARGO (`Escape`): quit app
+
+Quit behavior:
+- Best-effort `end_session` (`close_session=true`)
+- Then `Application.Quit()`
+
+### 11.3 Session and patient lifecycle
+
+Client behavior:
+1. On app launch, generate a fresh `patient_id` (default enabled)
+2. Connect to workflow WS
+3. Send `start_session` once per app run
+4. Store returned `session_id` and reuse it for all turns in this app run
+5. On reconnect, continue with the same `session_id`
+6. On exit, send `end_session`, then quit
+7. Reopen app => new `patient_id` => new patient/session on server
+
+### 11.4 Audio workflow
+
+Default mode is chunked streaming:
+1. Start recording -> `audio_begin`
+2. During recording -> repeated `audio_chunk`
+3. Stop recording -> flush + `audio_end`
+4. Receive `turn_result`
+
+Fallback:
+- On chunk failure, client can fallback to one-shot `process_audio`
+
+Requested result fields:
+- `note_full`
+- `advice_full`
+- `summary_turn`
+- `running_summary`
+
+UI behavior:
+- After each turn result, auto-show `note_full`
+- Single press toggles to `advice_full` and back
+
+### 11.5 UI text fields
+
+In `UiRoot`, the presenter controls:
+- `header`: current mode (`NOTE`, `ADVICE`, `PHOTO`)
+- `status`: runtime state (`Connecting`, `Recording`, `Processing`, errors)
+- `connectivity`: `Online` / `Offline`
+- `recording`: `REC mm:ss` with pulse animation
+
+### 11.6 Optional photo enhancement
+
+Photo path is optional and non-breaking for audio-only usage.
+
+Flow:
+1. After turn result, prompt `Add photo?`
+2. If no selection within 3s, auto-select `No`
+3. If `Yes`, open live camera preview
+4. Capture photo
+5. Review page shows captured image with `Retake / Upload / Back`
+6. Upload sends last-turn audio + image via `process_audio`
+
+Optional image fields sent:
+- `image_b64`
+- `image_mime`
+- `image_width`
+- `image_height`
+
+### 11.7 Build and run (frontend)
+
+1. Open Unity project root (`Assets/`, `Packages/`, `ProjectSettings/`)
+2. Open `Assets/Scenes/SampleScene.unity`
+3. Set workflow URL in `ArGlassesClinicalAssistant`
+4. Build Android APK and install on glasses
+
+Useful runtime log filter:
+
+```bash
+PKG="com.DefaultCompany.Medgemma_glasses"
+PID="$(adb shell pidof "$PKG" | tr -d '\r' | awk '{print $1}')"
+adb logcat -c
+adb logcat --pid="$PID" -v time | grep -E "ArGlassesClinicalAssistant|ArWheelInputRouter|audio_begin|audio_chunk|audio_end|turn_result|session_started|session_summary|CAM|Photo"
+```
+
+### 11.8 Frontend troubleshooting
+
+1. Immediate `Processing failed` after recording starts:
+- Ensure server supports `audio_begin/audio_chunk/audio_end`
+
+2. Scroll appears not working:
+- If content does not exceed viewport height, there is no overflow to scroll
+
+3. Camera preview not visible:
+- Check camera permission and `ArPhotoCapture` initialization
+
+4. Server processed but glasses show no result:
+- Verify client receives/parses `turn_result` and reads `note_full/advice_full`
+
+5. Device cannot connect to backend:
+- Use reachable LAN/WSS URL, not local loopback unless using `adb reverse`
+
+### 11.9 Repo structure note
+
+This repository currently has a second Unity-like tree under `frontend/`.
+The active Unity implementation is the root project (`Assets/...`, `Packages/...`, `ProjectSettings/...`).
