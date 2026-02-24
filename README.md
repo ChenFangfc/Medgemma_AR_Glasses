@@ -1,4 +1,4 @@
-# Medgemm AR Glasses
+# EgoMedAgent: Agentic MedGemma Augmented Reality (AR)
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Unity](https://img.shields.io/badge/Unity-2022.3.21f1-000000?logo=unity&logoColor=white)](https://unity.com/)
