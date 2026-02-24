@@ -1,4 +1,29 @@
-# Medgemm AR Glasses Backend
+# Medgemm AR Glasses
+
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Unity](https://img.shields.io/badge/Unity-2022.3.21f1-000000?logo=unity&logoColor=white)](https://unity.com/)
+[![Protocol](https://img.shields.io/badge/Protocol-WebSocket-0A7EA4)](#workflow-api-port-8003)
+[![GPU](https://img.shields.io/badge/Runtime-CUDA-76B900?logo=nvidia&logoColor=white)](#runtime-and-dependencies)
+
+> [!NOTE]
+> This repository currently documents both backend and frontend. The backend workflow is the production-critical path, and the Unity section is included for integration reference.
+
+## Quick Navigation
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Runtime and Dependencies](#runtime-and-dependencies)
+- [Start and Stop Backend](#start-and-stop-backend)
+- [Workflow API (Port 8003)](#workflow-api-port-8003)
+- [Memory and Context Behavior](#memory-and-context-behavior)
+- [Image Handling (Gemma + Workflow)](#image-handling-gemma--workflow)
+- [Persistence Layout](#persistence-layout)
+- [Validation and Smoke Tests](#validation-and-smoke-tests)
+- [Key Environment Variables](#key-environment-variables)
+- [Operational Notes](#operational-notes)
+- [Frontend (Unity)](#frontend-unity)
+
+## Overview
 
 Backend services for real-time clinical workflow:
 
@@ -12,52 +37,40 @@ This README reflects the **current active backend code path**:
 - `server_gemma.py`
 - `server_pipeline.py`
 
-## 1) Architecture
+## Architecture
 
 ### Services
 
-1. ASR service (`server_asr.py`)
-- Port: `8001`
-- WS endpoint: `ws://<host>:8001/ws`
-- Health: `http://<host>:8001/health`
-- Model: `google/medasr`
-
-2. Gemma service (`server_gemma.py`)
-- Port: `8002`
-- WS endpoint: `ws://<host>:8002/ws`
-- Health: `http://<host>:8002/health`
-- Model: `google/medgemma-1.5-4b-it`
-- Optional image input (`image_b64`, `image_mime`)
-
-3. Workflow service (`server_pipeline.py`) (recommended client entrypoint)
-- Port: `8003`
-- WS endpoint: `ws://<host>:8003/ws`
-- Health: `http://<host>:8003/health`
-- Orchestrates ASR -> Gemma
-- Manages session memory and persistence
+| Service | Script | Port | WS Endpoint | Health Endpoint | Model | Notes |
+|---|---|---:|---|---|---|---|
+| ASR | `server_asr.py` | `8001` | `ws://<host>:8001/ws` | `http://<host>:8001/health` | `google/medasr` | Speech-to-text |
+| Gemma | `server_gemma.py` | `8002` | `ws://<host>:8002/ws` | `http://<host>:8002/health` | `google/medgemma-1.5-4b-it` | Supports optional `image_b64`, `image_mime` |
+| Workflow (recommended client entrypoint) | `server_pipeline.py` | `8003` | `ws://<host>:8003/ws` | `http://<host>:8003/health` | Orchestrator | ASR -> Gemma, session memory, persistence |
 
 ### Active vs Legacy Files
 
 Active runtime uses:
+
 - `server_asr.py`
 - `server_gemma.py`
 - `server_pipeline.py`
 
 Legacy/utility files (not used by startup scripts):
+
 - `medasr_ws_server.py`
 - `medgemma_ws_server.py`
 - `medasr_chat.py`
 - `medgemma_chat.py`
 
-## 2) Runtime and Dependencies
+## Runtime and Dependencies
 
-## 2.1 Python envs
+### Python envs
 
 - ASR service runs in `miniforge3/envs/medasr`
 - Gemma service runs in `miniforge3/envs/medgemma`
 - Workflow service runs in `miniforge3/envs/medasr`
 
-## 2.2 Install dependencies
+### Install dependencies
 
 ```bash
 cd /srv/local/chenf3/Medgemm_AR_Glasses/backend
@@ -65,17 +78,19 @@ bash install_ws_server_deps.sh
 ```
 
 Note:
+
 - `ffmpeg` is required by ASR decoding and chunked smoke tests.
 
-## 2.3 GPU placement
+### GPU placement
 
 Default GPU mapping from launch scripts:
+
 - ASR: `MEDASR_GPU=0`
 - Gemma: `MEDGEMMA_GPU=1`
 
-## 3) Start/Stop Backend
+## Start and Stop Backend
 
-## 3.1 tmux (recommended fallback)
+### tmux (recommended fallback)
 
 ```bash
 cd /srv/local/chenf3/Medgemm_AR_Glasses/backend
@@ -89,21 +104,21 @@ Stop:
 bash stop_model_ws_tmux.sh
 ```
 
-## 3.2 user systemd
+### user systemd
 
 ```bash
 cd /srv/local/chenf3/Medgemm_AR_Glasses/backend
 bash install_systemd_model_ws_services.sh
 ```
 
-## 3.3 root systemd
+### root systemd
 
 ```bash
 cd /srv/local/chenf3/Medgemm_AR_Glasses/backend
 bash install_systemd_root_model_ws_services.sh
 ```
 
-## 3.4 nohup scripts
+### nohup scripts
 
 ```bash
 bash start_model_ws_services.sh
@@ -113,7 +128,7 @@ bash stop_model_ws_services.sh
 
 Logs are written under `.logs/` when using nohup scripts.
 
-## 4) Workflow API (Port 8003)
+## Workflow API (Port 8003)
 
 Client should connect to `ws://<host>:8003/ws` (or `wss://.../ws` behind TLS proxy/ngrok).
 
@@ -128,9 +143,9 @@ On connect, server sends:
 }
 ```
 
-## 4.1 Session lifecycle
+### Session lifecycle
 
-### `start_session`
+#### `start_session`
 
 Request:
 
@@ -158,10 +173,11 @@ Response:
 ```
 
 Notes:
+
 - If `patient_id` is omitted, server auto-generates (`p_###_YYYYMMDD_HHMMSS`).
 - Reusing the same `session_id` keeps same in-memory context.
 
-### `end_session`
+#### `end_session`
 
 Request:
 
@@ -191,9 +207,9 @@ Response:
 }
 ```
 
-## 4.2 One-shot audio turn
+### One-shot audio turn
 
-### `process_audio` (audio only)
+#### `process_audio` (audio only)
 
 ```json
 {
@@ -205,7 +221,7 @@ Response:
 }
 ```
 
-### `process_audio` (audio + optional image)
+#### `process_audio` (audio + optional image)
 
 ```json
 {
@@ -231,9 +247,9 @@ Successful response (`turn_result`) includes:
 
 Default returned fields are all of the above. You can also specify `return`.
 
-## 4.3 Chunked audio turn
+### Chunked audio turn
 
-### `audio_begin`
+#### `audio_begin`
 
 ```json
 {
@@ -249,7 +265,7 @@ Default returned fields are all of the above. You can also specify `return`.
 }
 ```
 
-### `audio_chunk`
+#### `audio_chunk`
 
 ```json
 {
@@ -263,7 +279,7 @@ Default returned fields are all of the above. You can also specify `return`.
 }
 ```
 
-### `audio_end` (optional image supported)
+#### `audio_end` (optional image supported)
 
 ```json
 {
@@ -276,9 +292,9 @@ Default returned fields are all of the above. You can also specify `return`.
 }
 ```
 
-## 4.4 On-demand fetch
+### On-demand fetch
 
-### `get_latest`
+#### `get_latest`
 
 Request:
 
@@ -292,13 +308,14 @@ Request:
 ```
 
 `what` supports:
+
 - `note_full`
 - `advice_full`
 - `summary_turn`
 - `running_summary`
 - `asr_text`
 
-## 4.5 Error format
+### Error format
 
 Server returns:
 
@@ -311,30 +328,34 @@ Server returns:
 }
 ```
 
-## 5) Memory and Context Behavior
+## Memory and Context Behavior
 
 Per session:
+
 - Each turn generates `summary_turn`.
 - `running_summary` is updated by merging prior summary + current turn summary.
 - Next turn prompt uses `running_summary + current ASR transcript`.
 
 Important:
+
 - Memory is scoped to `session_id`.
 - Closing session (`end_session` default behavior) removes in-memory state for that session.
 - Keep one `session_id` across multi-turn conversation for one patient.
 
-## 6) Image Handling (Gemma + Workflow)
+## Image Handling (Gemma + Workflow)
 
 When image is provided:
+
 - Workflow validates/decode bounds (`WORKFLOW_IMAGE_MAX_BYTES`, default 8MB).
 - Gemma service decodes and normalizes image to `896x896` via center-pad letterbox.
 - Same prompt pipeline is used; image is optional context enhancer.
 - Workflow persists image file as `turns/000N_image.<ext>`.
 
 If image is omitted:
+
 - behavior is identical to current audio-only flow.
 
-## 7) Persistence Layout
+## Persistence Layout
 
 Default root:
 
@@ -358,9 +379,9 @@ patients/<patient_id>/sessions/<session_id>/
     0002.json
 ```
 
-## 8) Validation / Smoke Tests
+## Validation and Smoke Tests
 
-## 8.1 One-shot workflow test
+### One-shot workflow test
 
 ```bash
 python3 scripts/workflow_smoke_test.py \
@@ -378,7 +399,7 @@ python3 scripts/workflow_smoke_test.py \
   --image /path/to/image.jpg
 ```
 
-## 8.2 Chunked workflow test
+### Chunked workflow test
 
 ```bash
 python3 scripts/workflow_chunked_smoke_test.py \
@@ -396,15 +417,16 @@ python3 scripts/workflow_chunked_smoke_test.py \
   --image /path/to/image.png
 ```
 
-## 8.3 Manual pipeline test client
+### Manual pipeline test client
 
 ```bash
 python3 test_pipeline_ws.py /srv/local/chenf3/medasr_test001.m4a
 ```
 
-## 9) Key Environment Variables
+## Key Environment Variables
 
 Workflow:
+
 - `ASR_WS_URL`
 - `GEMMA_WS_URL`
 - `WORKFLOW_TIMEOUT_S`
@@ -416,6 +438,7 @@ Workflow:
 - `WORKFLOW_ADVICE_MAX_NEW_TOKENS`
 
 ASR:
+
 - `MEDASR_GPU`
 - `ASR_TIMEOUT_S`
 - `ASR_CONCURRENCY`
@@ -423,13 +446,14 @@ ASR:
 - `ASR_STRIDE_LENGTH_S`
 
 Gemma:
+
 - `MEDGEMMA_GPU`
 - `GEMMA_TIMEOUT_S`
 - `GEMMA_CONCURRENCY`
 - `GEMMA_IMAGE_SIZE`
 - `GEMMA_IMAGE_MAX_BYTES`
 
-## 10) Operational Notes
+## Operational Notes
 
 1. Keep each service at one worker (`--workers 1`) unless you redesign shared session state.
 2. If exposing externally (ngrok/public), use `wss://` and enforce auth/rate limits upstream.
@@ -441,13 +465,14 @@ Gemma:
 
 ---
 
-## 11) Frontend (Unity)
+## Frontend (Unity)
 
 This section documents the Unity AR glasses client.
 
-### 11.1 Project scope
+### Project scope
 
 Frontend responsibilities:
+
 - Capture wheel input and voice commands
 - Record microphone audio
 - Send workflow requests over WebSocket
@@ -455,6 +480,7 @@ Frontend responsibilities:
 - Optional photo capture and upload enhancement
 
 Main Unity scripts:
+
 - `Assets/Scripts/ArGlassesClinicalAssistant.cs`
 - `Assets/Scripts/ArWorkflowWebSocket.cs`
 - `Assets/Scripts/ArAudioRecorder.cs`
@@ -466,26 +492,31 @@ Main Unity scripts:
 - `Assets/Scripts/ArSimpleJson.cs`
 
 Unity version:
+
 - `2022.3.21f1`
 
 Main scene:
+
 - `Assets/Scenes/SampleScene.unity`
 
-### 11.2 Input mapping
+### Input mapping
 
 Current mapping:
+
 - Single press (`Return`): toggle view `NOTE <-> ADVICE`
 - Long press (`Menu`): start/stop recording
 - Scroll (`LeftArrow`/`RightArrow`): smooth body scroll
 - Double click on ARGO (`Escape`): quit app
 
 Quit behavior:
+
 - Best-effort `end_session` (`close_session=true`)
 - Then `Application.Quit()`
 
-### 11.3 Session and patient lifecycle
+### Session and patient lifecycle
 
 Client behavior:
+
 1. On app launch, generate a fresh `patient_id` (default enabled)
 2. Connect to workflow WS
 3. Send `start_session` once per app run
@@ -494,40 +525,46 @@ Client behavior:
 6. On exit, send `end_session`, then quit
 7. Reopen app => new `patient_id` => new patient/session on server
 
-### 11.4 Audio workflow
+### Audio workflow
 
 Default mode is chunked streaming:
+
 1. Start recording -> `audio_begin`
 2. During recording -> repeated `audio_chunk`
 3. Stop recording -> flush + `audio_end`
 4. Receive `turn_result`
 
 Fallback:
+
 - On chunk failure, client can fallback to one-shot `process_audio`
 
 Requested result fields:
+
 - `note_full`
 - `advice_full`
 - `summary_turn`
 - `running_summary`
 
 UI behavior:
+
 - After each turn result, auto-show `note_full`
 - Single press toggles to `advice_full` and back
 
-### 11.5 UI text fields
+### UI text fields
 
 In `UiRoot`, the presenter controls:
+
 - `header`: current mode (`NOTE`, `ADVICE`, `PHOTO`)
 - `status`: runtime state (`Connecting`, `Recording`, `Processing`, errors)
 - `connectivity`: `Online` / `Offline`
 - `recording`: `REC mm:ss` with pulse animation
 
-### 11.6 Optional photo enhancement
+### Optional photo enhancement
 
 Photo path is optional and non-breaking for audio-only usage.
 
 Flow:
+
 1. After turn result, prompt `Add photo?`
 2. If no selection within 3s, auto-select `No`
 3. If `Yes`, open live camera preview
@@ -536,12 +573,13 @@ Flow:
 6. Upload sends last-turn audio + image via `process_audio`
 
 Optional image fields sent:
+
 - `image_b64`
 - `image_mime`
 - `image_width`
 - `image_height`
 
-### 11.7 Build and run (frontend)
+### Build and run (frontend)
 
 1. Open Unity project root (`Assets/`, `Packages/`, `ProjectSettings/`)
 2. Open `Assets/Scenes/SampleScene.unity`
@@ -557,7 +595,7 @@ adb logcat -c
 adb logcat --pid="$PID" -v time | grep -E "ArGlassesClinicalAssistant|ArWheelInputRouter|audio_begin|audio_chunk|audio_end|turn_result|session_started|session_summary|CAM|Photo"
 ```
 
-### 11.8 Frontend troubleshooting
+### Frontend troubleshooting
 
 1. Immediate `Processing failed` after recording starts:
 - Ensure server supports `audio_begin/audio_chunk/audio_end`
@@ -574,7 +612,7 @@ adb logcat --pid="$PID" -v time | grep -E "ArGlassesClinicalAssistant|ArWheelInp
 5. Device cannot connect to backend:
 - Use reachable LAN/WSS URL, not local loopback unless using `adb reverse`
 
-### 11.9 Repo structure note
+### Repo structure note
 
 This repository currently has a second Unity-like tree under `frontend/`.
 The active Unity implementation is the root project (`Assets/...`, `Packages/...`, `ProjectSettings/...`).
